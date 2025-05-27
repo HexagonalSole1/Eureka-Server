@@ -4,6 +4,7 @@ spring:
   profiles:
     active: prod
 
+#estoy apuntando a server1
   config:
     import: configserver:http://34.239.38.109:8888
 
