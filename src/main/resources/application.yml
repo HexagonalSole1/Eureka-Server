@@ -2,8 +2,7 @@ spring:
   application:
     name: eureka-server
   profiles:
-    active: qa
-
+    active: prod
 
 #estoy apuntando a server1
   config:
