@@ -25,9 +25,9 @@ pipeline {
         EUREKA_PORT = "${env.BRANCH_NAME == 'main' ? '8761' : env.BRANCH_NAME == 'qa' ? '8762' : '8763'}"
         
         EC2_USER = 'ubuntu'
-        EC2_IP_DEV = '35.168.222.61'
-        EC2_IP_QA = '54.161.193.236'
-        EC2_IP_PROD = '34.227.172.83'
+        EC2_IP_DEV = '23.22.115.242'
+        EC2_IP_QA = '3.220.122.151'
+        EC2_IP_PROD = '34.224.192.38'
         
         REMOTE_PATH = '/home/ubuntu/eureka-server'
         SSH_KEY = credentials('ssh-key-ec2')
