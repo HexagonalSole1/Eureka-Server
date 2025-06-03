@@ -1,3 +1,7 @@
+// ==========================================
+// JENKINSFILE PARA EUREKA SERVER CON SYSTEMD
+// ==========================================
+
 pipeline {
     agent any
 
@@ -5,12 +9,10 @@ pipeline {
         maven 'Maven'
     }
 
-    // ✅ SOLO TRIGGER POR PUSH
     triggers {
         githubPush()
     }
 
-    // ✅ OPCIONES DEL PIPELINE
     options {
         disableConcurrentBuilds()
         timeout(time: 30, unit: 'MINUTES')
@@ -18,29 +20,18 @@ pipeline {
     }
 
     environment {
-        // Detectar rama automáticamente
         BRANCH_NAME = "${env.GIT_BRANCH?.replaceAll('origin/', '') ?: env.BRANCH_NAME ?: 'dev'}"
-
-        // Variables de entorno según la rama
         ENV = "${env.BRANCH_NAME == 'main' ? 'prod' : env.BRANCH_NAME}"
-
-        // Puerto para Eureka según entorno
         EUREKA_PORT = "${env.BRANCH_NAME == 'main' ? '8761' : env.BRANCH_NAME == 'qa' ? '8762' : '8763'}"
-
-        // Configuración de EC2 según el entorno
+        
         EC2_USER = 'ubuntu'
         EC2_IP_DEV = '35.168.222.61'
         EC2_IP_QA = '54.161.193.236'
         EC2_IP_PROD = '34.227.172.83'
-
-
-        // Rutas de despliegue en EC2
+        
         REMOTE_PATH = '/home/ubuntu/eureka-server'
-
-        // Credenciales
         SSH_KEY = credentials('ssh-key-ec2')
-
-        // Variables para Java 21
+        
         JDK_DIR = "${WORKSPACE}/jdk21"
         JAVA_HOME = "${JDK_DIR}"
         PATH = "${JDK_DIR}/bin:${PATH}"
@@ -53,7 +44,6 @@ pipeline {
                     echo "🔍 [EUREKA] Rama detectada: ${env.BRANCH_NAME}"
                     echo "🌍 [EUREKA] Entorno: ${env.ENV}"
 
-                    // Lógica de despliegue automático por rama
                     if (env.BRANCH_NAME == 'dev') {
                         echo "🚀 [EUREKA] ESTRATEGIA: Deploy automático a DEV"
                         env.DEPLOY_STRATEGY = 'auto'
@@ -176,7 +166,7 @@ pipeline {
             }
         }
 
-        stage('🚀 Deploy Eureka Server') {
+        stage('🚀 Deploy Eureka Server with Systemd') {
             when {
                 anyOf {
                     environment name: 'DEPLOY_STRATEGY', value: 'auto'
@@ -187,7 +177,6 @@ pipeline {
                 script {
                     def EC2_IP = ''
 
-                    // Determinar IP según entorno
                     if (env.TARGET_ENV == 'prod') {
                         EC2_IP = env.EC2_IP_PROD
                     } else if (env.TARGET_ENV == 'qa') {
@@ -198,11 +187,13 @@ pipeline {
 
                     echo "🚀 [EUREKA] Desplegando en ${env.TARGET_ENV.toUpperCase()} (${EC2_IP})"
 
-                    // Preparar servidor
+                    // 1. Preparar servidor e instalar dependencias
                     sh """
                     echo "🔧 [EUREKA] Preparando servidor..."
                     ssh -i \$SSH_KEY -o StrictHostKeyChecking=no -o ConnectTimeout=30 ${EC2_USER}@${EC2_IP} '
-                        mkdir -p ${REMOTE_PATH}
+                        # Crear directorios
+                        sudo mkdir -p ${REMOTE_PATH}
+                        sudo chown -R ubuntu:ubuntu ${REMOTE_PATH}
 
                         # Instalar herramientas básicas
                         which curl > /dev/null || sudo apt-get update -qq && sudo apt-get install -y curl
@@ -218,136 +209,107 @@ pipeline {
                     '
                     """
 
-                    // Copiar JAR
+                    // 2. Detener servicio existente si existe
+                    sh """
+                    echo "🛑 [EUREKA] Deteniendo servicio existente..."
+                    ssh -i \$SSH_KEY -o StrictHostKeyChecking=no ${EC2_USER}@${EC2_IP} '
+                        if sudo systemctl is-active --quiet eureka-server.service; then
+                            echo "🛑 Deteniendo servicio eureka-server..."
+                            sudo systemctl stop eureka-server.service
+                            sleep 5
+                        else
+                            echo "ℹ️ Servicio eureka-server no está corriendo"
+                        fi
+                    ' || echo "⚠️ [EUREKA] No hay servicio previo o error al detener"
+                    """
+
+                    // 3. Copiar JAR
                     sh """
                     echo "📦 [EUREKA] Copiando JAR..."
                     scp -i \$SSH_KEY -o StrictHostKeyChecking=no target/discoveryService-0.0.1-SNAPSHOT.jar ${EC2_USER}@${EC2_IP}:${REMOTE_PATH}/
                     echo "✅ [EUREKA] JAR copiado"
                     """
 
-                    // Script de inicio para Eureka
-                    def startScript = """#!/bin/bash
-JAR_FILE="${REMOTE_PATH}/discoveryService-0.0.1-SNAPSHOT.jar"
-PID_FILE="${REMOTE_PATH}/eureka.pid"
-LOG_FILE="${REMOTE_PATH}/eureka.log"
+                    // 4. Crear archivo de servicio systemd
+                    def systemdService = """[Unit]
+Description=Spring Boot Eureka Discovery Server
+After=network.target
+Wants=network-online.target
+After=network-online.target
 
-echo "🚀 [EUREKA] Iniciando Eureka Server..."
-
-# Detener proceso existente
-if [ -f \$PID_FILE ]; then
-    PID=\$(cat \$PID_FILE)
-    if ps -p \$PID > /dev/null; then
-        echo "🛑 [EUREKA] Deteniendo proceso existente (PID: \$PID)"
-        kill \$PID
-        sleep 10
-
-        # Force kill si sigue corriendo
-        if ps -p \$PID > /dev/null; then
-            echo "🔨 [EUREKA] Force killing process"
-            kill -9 \$PID
-            sleep 5
-        fi
-    fi
-    rm -f \$PID_FILE
-fi
-
-# Verificar puerto libre
-if netstat -tuln | grep :${EUREKA_PORT} > /dev/null; then
-    echo "⚠️ [EUREKA] Puerto ${EUREKA_PORT} en uso, intentando liberar..."
-    sudo fuser -k ${EUREKA_PORT}/tcp || true
-    sleep 5
-fi
-
-# Iniciar Eureka
-echo "🎬 [EUREKA] Iniciando en puerto ${EUREKA_PORT}..."
-nohup java -jar \$JAR_FILE \\
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=${REMOTE_PATH}
+ExecStart=/usr/bin/java -jar ${REMOTE_PATH}/discoveryService-0.0.1-SNAPSHOT.jar \\
     --spring.profiles.active=${ENV} \\
     --server.port=${EUREKA_PORT} \\
     --logging.level.root=INFO \\
     --logging.level.com.netflix.eureka=DEBUG \\
-    > \$LOG_FILE 2>&1 &
+    --logging.file.name=${REMOTE_PATH}/eureka.log
 
-echo \$! > \$PID_FILE
-echo "✅ [EUREKA] Iniciado - PID: \$(cat \$PID_FILE), Puerto: ${EUREKA_PORT}"
+# Configuración de reinicio
+Restart=on-failure
+RestartSec=10
+SuccessExitStatus=143
 
-# Mostrar estado inicial
-sleep 10
-if ps -p \$(cat \$PID_FILE) > /dev/null; then
-    echo "✅ [EUREKA] Proceso corriendo correctamente"
-else
-    echo "❌ [EUREKA] Error al iniciar - Ver logs:"
-    tail -20 \$LOG_FILE
-    exit 1
-fi
-"""
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=eureka-server
 
-                    // Script de control
-                    def controlScript = """#!/bin/bash
-PID_FILE="${REMOTE_PATH}/eureka.pid"
-LOG_FILE="${REMOTE_PATH}/eureka.log"
+# Seguridad
+NoNewPrivileges=true
+PrivateTmp=true
 
-case \$1 in
-    start)
-        ${REMOTE_PATH}/start-eureka.sh
-        ;;
-    stop)
-        echo "🛑 [EUREKA] Deteniendo servicio..."
-        if [ -f \$PID_FILE ]; then
-            PID=\$(cat \$PID_FILE)
-            if ps -p \$PID > /dev/null; then
-                kill \$PID
-                echo "✅ [EUREKA] Proceso detenido"
-            fi
-            rm -f \$PID_FILE
-        else
-            echo "⚠️ [EUREKA] No hay proceso corriendo"
-        fi
-        ;;
-    status)
-        echo "📊 [EUREKA] Estado del servicio:"
-        if [ -f \$PID_FILE ]; then
-            PID=\$(cat \$PID_FILE)
-            if ps -p \$PID > /dev/null; then
-                echo "✅ [EUREKA] Proceso corriendo (PID: \$PID)"
-                curl -f http://localhost:${EUREKA_PORT}/actuator/health 2>/dev/null && echo "✅ [EUREKA] Health: OK" || echo "❌ [EUREKA] Health: FAIL"
-            else
-                echo "❌ [EUREKA] Proceso no encontrado"
-            fi
-        else
-            echo "❌ [EUREKA] PID file no existe"
-        fi
-        ;;
-    logs)
-        echo "📄 [EUREKA] Últimos logs:"
-        tail -50 \$LOG_FILE
-        ;;
-    restart)
-        \$0 stop
-        sleep 5
-        \$0 start
-        ;;
-    *)
-        echo "Uso: \$0 {start|stop|status|logs|restart}"
-        ;;
-esac
-"""
+# Variables de entorno
+Environment=JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+Environment=SPRING_PROFILES_ACTIVE=${ENV}
 
-                    // Crear scripts
+[Install]
+WantedBy=multi-user.target"""
+
+                    // 5. Configurar servicio systemd
                     sh """
-                    echo "📝 [EUREKA] Creando scripts de control..."
-                    echo '${startScript}' | ssh -i \$SSH_KEY -o StrictHostKeyChecking=no ${EC2_USER}@${EC2_IP} 'cat > ${REMOTE_PATH}/start-eureka.sh'
-                    echo '${controlScript}' | ssh -i \$SSH_KEY -o StrictHostKeyChecking=no ${EC2_USER}@${EC2_IP} 'cat > ${REMOTE_PATH}/eureka-control.sh'
-
+                    echo "⚙️ [EUREKA] Configurando servicio systemd..."
+                    
+                    # Crear archivo de servicio
+                    echo '${systemdService}' | ssh -i \$SSH_KEY -o StrictHostKeyChecking=no ${EC2_USER}@${EC2_IP} 'sudo tee /etc/systemd/system/eureka-server.service > /dev/null'
+                    
+                    # Configurar systemd
                     ssh -i \$SSH_KEY -o StrictHostKeyChecking=no ${EC2_USER}@${EC2_IP} '
-                        chmod +x ${REMOTE_PATH}/start-eureka.sh
-                        chmod +x ${REMOTE_PATH}/eureka-control.sh
+                        # Recargar configuración
+                        sudo systemctl daemon-reload
+                        
+                        # Habilitar servicio para auto-inicio
+                        sudo systemctl enable eureka-server.service
+                        
+                        echo "✅ [EUREKA] Servicio systemd configurado"
                     '
                     """
 
-                    // Ejecutar deploy
+                    // 6. Iniciar servicio
                     sh """
-                    echo "🚀 [EUREKA] Ejecutando deploy..."
-                    ssh -i \$SSH_KEY -o StrictHostKeyChecking=no ${EC2_USER}@${EC2_IP} '${REMOTE_PATH}/eureka-control.sh start'
+                    echo "🚀 [EUREKA] Iniciando servicio..."
+                    ssh -i \$SSH_KEY -o StrictHostKeyChecking=no ${EC2_USER}@${EC2_IP} '
+                        # Iniciar servicio
+                        sudo systemctl start eureka-server.service
+                        
+                        # Esperar un momento
+                        sleep 5
+                        
+                        # Verificar estado
+                        if sudo systemctl is-active --quiet eureka-server.service; then
+                            echo "✅ [EUREKA] Servicio iniciado correctamente"
+                            sudo systemctl status eureka-server.service --no-pager -l
+                        else
+                            echo "❌ [EUREKA] Error al iniciar servicio"
+                            sudo systemctl status eureka-server.service --no-pager -l
+                            sudo journalctl -u eureka-server.service --since \"5 minutes ago\" --no-pager
+                            exit 1
+                        fi
+                    '
                     """
 
                     echo "✅ [EUREKA] Deploy completado en ${env.TARGET_ENV.toUpperCase()}!"
@@ -377,34 +339,49 @@ esac
                     echo "🔍 [EUREKA] Verificando deploy en ${env.TARGET_ENV.toUpperCase()}..."
 
                     // Esperar que el servicio esté listo
-                    sh "sleep 60"
+                    sh "sleep 30"
 
                     // Verificar health
                     sh """
-                    echo "🏥 [EUREKA] Verificando health endpoint..."
+                    echo "🏥 [EUREKA] Verificando servicio..."
 
-                    # Verificar proceso
-                    ssh -i \$SSH_KEY -o StrictHostKeyChecking=no ${EC2_USER}@${EC2_IP} '${REMOTE_PATH}/eureka-control.sh status'
-
-                    # Verificar health endpoint
-                    for i in {1..15}; do
-                        if ssh -i \$SSH_KEY -o StrictHostKeyChecking=no ${EC2_USER}@${EC2_IP} 'curl -f http://localhost:${EUREKA_PORT}/actuator/health' 2>/dev/null; then
-                            echo "✅ [EUREKA] Health Check: PASSED"
-                            break
+                    ssh -i \$SSH_KEY -o StrictHostKeyChecking=no ${EC2_USER}@${EC2_IP} '
+                        # Verificar estado del servicio
+                        echo "📊 Estado del servicio:"
+                        sudo systemctl status eureka-server.service --no-pager
+                        
+                        # Verificar que esté habilitado para auto-inicio
+                        if sudo systemctl is-enabled eureka-server.service; then
+                            echo "✅ [EUREKA] Servicio habilitado para auto-inicio"
+                        else
+                            echo "⚠️ [EUREKA] Servicio NO habilitado para auto-inicio"
                         fi
-                        echo "⏳ [EUREKA] Esperando health endpoint... (\$i/15)"
-                        sleep 10
-                    done
-
-                    # Verificar Eureka Dashboard
-                    if ssh -i \$SSH_KEY -o StrictHostKeyChecking=no ${EC2_USER}@${EC2_IP} 'curl -f http://localhost:${EUREKA_PORT}/' 2>/dev/null; then
-                        echo "✅ [EUREKA] Dashboard: ACCESSIBLE"
-                    else
-                        echo "⚠️ [EUREKA] Dashboard: NOT_ACCESSIBLE"
-                    fi
+                        
+                        # Verificar health endpoint
+                        echo "🏥 Verificando health endpoint..."
+                        for i in {1..10}; do
+                            if curl -f http://localhost:${EUREKA_PORT}/actuator/health 2>/dev/null; then
+                                echo "✅ [EUREKA] Health Check: PASSED"
+                                break
+                            fi
+                            echo "⏳ [EUREKA] Esperando health endpoint... (\$i/10)"
+                            sleep 10
+                        done
+                        
+                        # Verificar Eureka Dashboard
+                        if curl -f http://localhost:${EUREKA_PORT}/ 2>/dev/null; then
+                            echo "✅ [EUREKA] Dashboard: ACCESSIBLE"
+                        else
+                            echo "⚠️ [EUREKA] Dashboard: NOT_ACCESSIBLE"
+                        fi
+                        
+                        # Mostrar últimos logs
+                        echo "📄 Últimos logs del servicio:"
+                        sudo journalctl -u eureka-server.service --since \"2 minutes ago\" --no-pager | tail -20
+                    '
+                    """
 
                     echo "✅ [EUREKA] Verificación completada"
-                    """
                 }
             }
         }
@@ -429,15 +406,20 @@ esac
 📋 Servicio desplegado:
    • Eureka Server: Puerto ${EUREKA_PORT}
    • Servidor: ${EC2_IP}
+   • Servicio systemd: eureka-server.service
 
 🌐 URLs de verificación:
    • Health: http://${EC2_IP}:${EUREKA_PORT}/actuator/health
    • Dashboard: http://${EC2_IP}:${EUREKA_PORT}/
 
-🛠️ Comandos útiles:
-   • Estado: ${REMOTE_PATH}/eureka-control.sh status
-   • Logs: ${REMOTE_PATH}/eureka-control.sh logs
-   • Reiniciar: ${REMOTE_PATH}/eureka-control.sh restart
+🛠️ Comandos útiles (systemd):
+   • Estado: sudo systemctl status eureka-server.service
+   • Logs: sudo journalctl -u eureka-server.service -f
+   • Reiniciar: sudo systemctl restart eureka-server.service
+   • Detener: sudo systemctl stop eureka-server.service
+   • Iniciar: sudo systemctl start eureka-server.service
+
+✅ El servicio se iniciará automáticamente al reiniciar el servidor
 """
                 } else {
                     echo "✅ [EUREKA] Compilación exitosa - Rama: ${env.BRANCH_NAME}"
@@ -456,13 +438,14 @@ esac
    • Build: ${env.BUILD_NUMBER}
    • URL: ${env.BUILD_URL}
 
-🛠️ Revisar logs para más detalles
+🛠️ Para debugging:
+   • sudo systemctl status eureka-server.service
+   • sudo journalctl -u eureka-server.service
 """
         }
 
         cleanup {
             sh '''
-                # Limpiar archivos temporales
                 rm -rf jdk21.tar.gz || true
                 echo "✅ [EUREKA] Limpieza completada"
             '''
